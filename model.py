@@ -711,6 +711,285 @@ def generate_submission_file(test_id, test_preds, model_name="model"):
     print(f"Submission file saved to {submission_file}")
     return submission
 
+def analyze_model_performance(models, train_features, test_features, train_target, test_id, output_path):
+    """Analyze model performance across different segments"""
+    results = {}
+    
+    # Create segments based on various features
+    segments = {}
+    
+    # By income level
+    if 'AMT_INCOME_TOTAL' in train_features.columns:
+        train_features['INCOME_GROUP'] = pd.qcut(train_features['AMT_INCOME_TOTAL'], 4, labels=['Low', 'Medium-Low', 'Medium-High', 'High'])
+        segments['INCOME_GROUP'] = train_features['INCOME_GROUP']
+    
+    # By age
+    if 'DAYS_BIRTH' in train_features.columns:
+        age_years = -train_features['DAYS_BIRTH'] / 365
+        train_features['AGE_GROUP'] = pd.cut(age_years, [20, 35, 50, 65, 100], labels=['20-35', '35-50', '50-65', '65+'])
+        segments['AGE_GROUP'] = train_features['AGE_GROUP']
+    
+    # By employment length
+    if 'DAYS_EMPLOYED' in train_features.columns:
+        emp_years = -train_features['DAYS_EMPLOYED'] / 365
+        train_features['EMPLOYMENT_GROUP'] = pd.cut(emp_years, [-1, 1, 5, 10, 100], labels=['<1 year', '1-5 years', '5-10 years', '10+ years'])
+        segments['EMPLOYMENT_GROUP'] = train_features['EMPLOYMENT_GROUP']
+    
+    # By credit amount
+    if 'AMT_CREDIT' in train_features.columns:
+        train_features['CREDIT_GROUP'] = pd.qcut(train_features['AMT_CREDIT'], 4, labels=['Low', 'Medium-Low', 'Medium-High', 'High'])
+        segments['CREDIT_GROUP'] = train_features['CREDIT_GROUP']
+    
+    # Calculate metrics for each segment
+    for segment_name, segment_values in segments.items():
+        results[segment_name] = {}
+        
+        for segment_value in segment_values.unique():
+            if pd.isna(segment_value):
+                continue
+                
+            segment_mask = segment_values == segment_value
+            segment_target = train_target[segment_mask]
+            
+            if len(segment_target) < 10:  # Skip very small segments
+                continue
+                
+            results[segment_name][segment_value] = {
+                'count': len(segment_target),
+                'target_rate': segment_target.mean()
+            }
+            
+            # Calculate model performance on segment
+            for model_name, model_preds in models.items():
+                segment_preds = model_preds[segment_mask]
+                if len(segment_preds) > 0:
+                    results[segment_name][segment_value][f'{model_name}_auc'] = roc_auc_score(segment_target, segment_preds)
+    
+    # Save results to CSV for further analysis
+    segment_results = []
+    for segment_name, segment_data in results.items():
+        for segment_value, metrics in segment_data.items():
+            row = {'Segment': segment_name, 'Value': segment_value}
+            row.update(metrics)
+            segment_results.append(row)
+            
+    segment_df = pd.DataFrame(segment_results)
+    segment_df.to_csv(f"{output_path}/segment_performance.csv", index=False)
+    
+    # Create visualizations
+    for segment_name in results.keys():
+        plt.figure(figsize=(12, 6))
+        
+        # Filter data for plotting
+        plot_data = segment_df[segment_df['Segment'] == segment_name]
+        
+        # Create bar chart of segment target rates
+        ax1 = plt.subplot(1, 2, 1)
+        sns.barplot(x='Value', y='target_rate', data=plot_data, ax=ax1)
+        ax1.set_title(f'Default Rate by {segment_name}')
+        ax1.set_ylabel('Default Rate')
+        ax1.set_xlabel(segment_name)
+        
+        # Create bar chart of model performance by segment
+        ax2 = plt.subplot(1, 2, 2)
+        model_cols = [col for col in plot_data.columns if 'auc' in col]
+        if model_cols:
+            plot_data_melted = pd.melt(
+                plot_data, 
+                id_vars=['Value'], 
+                value_vars=model_cols,
+                var_name='Model', 
+                value_name='AUC'
+            )
+            plot_data_melted['Model'] = plot_data_melted['Model'].str.replace('_auc', '')
+            sns.barplot(x='Value', y='AUC', hue='Model', data=plot_data_melted, ax=ax2)
+            ax2.set_title(f'Model Performance by {segment_name}')
+            ax2.set_ylabel('AUC')
+            ax2.set_xlabel(segment_name)
+        
+        plt.tight_layout()
+        plt.savefig(f"{output_path}/segment_{segment_name}.png")
+        plt.close()
+        
+    return segment_df
+
+def compare_model_predictions(models, train_features, train_target, test_features, test_id, output_path):
+    """Compare predictions from different models"""
+    if len(models) < 2:
+        print("Need at least 2 models to compare predictions")
+        return
+    
+    # Create correlation matrix of model predictions
+    model_names = list(models.keys())
+    corr_matrix = np.zeros((len(model_names), len(model_names)))
+    
+    for i, model1 in enumerate(model_names):
+        for j, model2 in enumerate(model_names):
+            corr_matrix[i, j] = np.corrcoef(models[model1], models[model2])[0, 1]
+    
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(corr_matrix, annot=True, xticklabels=model_names, yticklabels=model_names, cmap='YlGnBu')
+    plt.title('Correlation of Model Predictions')
+    plt.tight_layout()
+    plt.savefig(f"{output_path}/model_correlation.png")
+    plt.close()
+    
+    # Analyze where models disagree
+    disagreement_df = pd.DataFrame()
+    
+    for model_name, model_preds in models.items():
+        disagreement_df[model_name] = model_preds
+        
+    disagreement_df['target'] = train_target.values
+    disagreement_df['pred_variance'] = disagreement_df[model_names].var(axis=1)
+    
+    # Sort by prediction variance (highest disagreement first)
+    disagreement_df = disagreement_df.sort_values('pred_variance', ascending=False)
+    
+    # Save top disagreement cases
+    disagreement_df.head(1000).to_csv(f"{output_path}/model_disagreements.csv", index=False)
+    
+    # Plot histogram of prediction variances
+    plt.figure(figsize=(10, 6))
+    sns.histplot(disagreement_df['pred_variance'], kde=True)
+    plt.title('Distribution of Model Prediction Variance')
+    plt.xlabel('Variance between model predictions')
+    plt.ylabel('Count')
+    plt.tight_layout()
+    plt.savefig(f"{output_path}/prediction_variance.png")
+    plt.close()
+    
+    return disagreement_df
+
+def plot_roc_curves(models, train_target, output_path):
+    """Plot ROC curves for all models"""
+    plt.figure(figsize=(10, 8))
+    
+    for model_name, model_preds in models.items():
+        fpr, tpr, _ = roc_curve(train_target, model_preds)
+        auc = roc_auc_score(train_target, model_preds)
+        plt.plot(fpr, tpr, label=f'{model_name} (AUC = {auc:.4f})')
+    
+    # Add random classifier reference line
+    plt.plot([0, 1], [0, 1], 'k--', label='Random')
+    
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curves for All Models')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{output_path}/roc_curves.png")
+    plt.close()
+
+def analyze_feature_correlations(train_features, train_target, n_features=30, output_path='.'):
+    """Analyze correlations between features and with target"""
+    # Select top features correlated with target
+    feature_correlations = pd.DataFrame(index=train_features.columns)
+    feature_correlations['target_correlation'] = [
+        np.corrcoef(train_features[col].fillna(0), train_target)[0, 1] for col in train_features.columns
+    ]
+    
+    top_features = feature_correlations.abs().sort_values('target_correlation', ascending=False).head(n_features).index
+    
+    # Create correlation matrix for top features
+    corr_matrix = train_features[top_features].corr()
+    
+    # Plot correlation heatmap
+    plt.figure(figsize=(12, 10))
+    mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+    sns.heatmap(corr_matrix, mask=mask, cmap='YlGnBu', annot=False, center=0, square=True)
+    plt.title(f'Correlation Matrix of Top {n_features} Features')
+    plt.tight_layout()
+    plt.savefig(f"{output_path}/feature_correlation.png")
+    plt.close()
+    
+    # Save feature-target correlations
+    feature_correlations.sort_values('target_correlation', ascending=False).to_csv(
+        f"{output_path}/feature_target_correlation.csv"
+    )
+    
+    return feature_correlations
+
+def analyze_feature_importance(feature_importance_df, train_features, train_target, output_path):
+    """Analyze feature importance patterns"""
+    if feature_importance_df.empty:
+        print("No feature importance data available")
+        return
+        
+    # Calculate mean importance by feature
+    mean_importance = feature_importance_df.groupby('feature')['importance'].mean().reset_index()
+    mean_importance = mean_importance.sort_values('importance', ascending=False)
+    
+    # Get top 20 features
+    top_features = mean_importance.head(20)['feature'].tolist()
+    
+    # Create summary dataframe of top features
+    top_features_df = pd.DataFrame()
+    top_features_df['feature'] = top_features
+    
+    # Add importance
+    for feature in top_features:
+        importance = mean_importance[mean_importance['feature'] == feature]['importance'].values[0]
+        top_features_df.loc[top_features_df['feature'] == feature, 'importance'] = importance
+    
+    # Add correlation with target
+    for feature in top_features:
+        if feature in train_features.columns:
+            correlation = np.corrcoef(train_features[feature].fillna(0), train_target)[0, 1]
+            top_features_df.loc[top_features_df['feature'] == feature, 'target_correlation'] = correlation
+    
+    # Calculate stability of importance across folds
+    fold_stability = feature_importance_df.groupby('feature')['importance'].std() / feature_importance_df.groupby('feature')['importance'].mean()
+    fold_stability = fold_stability.reset_index()
+    fold_stability.columns = ['feature', 'importance_stability']
+    
+    # Add stability metrics
+    for feature in top_features:
+        stability = fold_stability[fold_stability['feature'] == feature]['importance_stability'].values
+        if len(stability) > 0:
+            top_features_df.loc[top_features_df['feature'] == feature, 'stability_score'] = stability[0]
+    
+    # Save detailed feature analysis
+    top_features_df.to_csv(f"{output_path}/top_features_analysis.csv", index=False)
+    
+    # Plot top feature distributions
+    for feature in top_features[:10]:  # Plot top 10 only to avoid too many plots
+        if feature in train_features.columns:
+            plt.figure(figsize=(12, 5))
+            
+            # Plot 1: Distribution by target value
+            plt.subplot(1, 2, 1)
+            sns.histplot(
+                data=pd.DataFrame({
+                    'feature': train_features[feature],
+                    'target': train_target
+                }), 
+                x='feature', 
+                hue='target',
+                kde=True,
+                stat='density'
+            )
+            plt.title(f'Distribution of {feature} by Target')
+            
+            # Plot 2: Box plot by target value
+            plt.subplot(1, 2, 2)
+            sns.boxplot(
+                x='target', 
+                y='feature',
+                data=pd.DataFrame({
+                    'feature': train_features[feature],
+                    'target': train_target
+                })
+            )
+            plt.title(f'Box Plot of {feature} by Target')
+            
+            plt.tight_layout()
+            plt.savefig(f"{output_path}/feature_distribution_{feature}.png")
+            plt.close()
+    
+    return top_features_df
+
 def get_model_params(model_type='lgbm', fast_mode=False):
     """Get model parameters based on model type and mode"""
     if fast_mode:
@@ -729,6 +1008,7 @@ def get_model_params(model_type='lgbm', fast_mode=False):
                 'random_state': 42
             }
         elif model_type == 'xgb':
+            # Simplified parameters for XGBoost
             return {
                 'max_depth': 6,
                 'learning_rate': 0.05,
@@ -736,8 +1016,6 @@ def get_model_params(model_type='lgbm', fast_mode=False):
                 'subsample': 0.8,
                 'colsample_bytree': 0.8,
                 'objective': 'binary:logistic',
-                'tree_method': 'hist',
-                'eval_metric': 'auc',
                 'random_state': 42
             }
         else:  # catboost
@@ -748,8 +1026,7 @@ def get_model_params(model_type='lgbm', fast_mode=False):
                 'l2_leaf_reg': 3,
                 'loss_function': 'Logloss',
                 'eval_metric': 'AUC',
-                'random_seed': 42,
-                'early_stopping_rounds': 200
+                'random_seed': 42
             }
     else:
         if model_type == 'lgbm':
@@ -767,6 +1044,7 @@ def get_model_params(model_type='lgbm', fast_mode=False):
                 'random_state': 42
             }
         elif model_type == 'xgb':
+            # Simplified parameters for XGBoost
             return {
                 'max_depth': 6,
                 'learning_rate': 0.02,
@@ -774,8 +1052,6 @@ def get_model_params(model_type='lgbm', fast_mode=False):
                 'subsample': 0.8,
                 'colsample_bytree': 0.8,
                 'objective': 'binary:logistic',
-                'tree_method': 'hist',
-                'eval_metric': 'auc',
                 'random_state': 42
             }
         else:  # catboost
@@ -786,8 +1062,7 @@ def get_model_params(model_type='lgbm', fast_mode=False):
                 'l2_leaf_reg': 3,
                 'loss_function': 'Logloss',
                 'eval_metric': 'AUC',
-                'random_seed': 42,
-                'early_stopping_rounds': 200
+                'random_seed': 42
             }
 
 def setup_logging(log_path):
@@ -807,35 +1082,29 @@ def train_model_safely(model_type, X_train, y_train, X_valid, y_valid, params, f
     try:
         if model_type == 'lgbm':
             model = lgb.LGBMClassifier(**params)
-            model.fit(
-                X_train, y_train,
-                eval_set=[(X_valid, y_valid)],
-                eval_metric='auc',
-                callbacks=[lgb.early_stopping(stopping_rounds=200)]
-            )
-        elif model_type == 'xgb':
-            # Try with callbacks first
             try:
-                callbacks = [xgb.callback.EarlyStopping(rounds=200)]
-                model = xgb.XGBClassifier(**params)
+                # Try with callbacks (newer LightGBM versions)
                 model.fit(
                     X_train, y_train,
                     eval_set=[(X_valid, y_valid)],
-                    callbacks=callbacks
+                    eval_metric='auc',
+                    callbacks=[lgb.early_stopping(stopping_rounds=200)]
                 )
             except:
-                # Fallback for older XGBoost versions
-                print(f"Warning: Using fallback method for XGBoost in fold {fold}")
-                model = xgb.XGBClassifier(**params)
-                eval_result = {}
+                # Fall back to early_stopping_rounds (older LightGBM versions)
+                print(f"Warning: Using fallback method for LightGBM in fold {fold}")
                 model.fit(
-                    X_train, y_train, 
+                    X_train, y_train,
                     eval_set=[(X_valid, y_valid)],
-                    early_stopping_rounds=200,
-                    verbose=False,
                     eval_metric='auc',
-                    callbacks=None
+                    early_stopping_rounds=200,
+                    verbose=100
                 )
+        elif model_type == 'xgb':
+            # Most basic fit for XGBoost - highest compatibility
+            model = xgb.XGBClassifier(**params)
+            model.fit(X_train, y_train)
+            
         else:  # catboost
             model = CatBoostClassifier(**params)
             model.fit(
@@ -1094,14 +1363,19 @@ def display_importances(feature_importance_df):
     except Exception as e:
         print(f"Error generating feature importance plot: {str(e)}")
 
-def main(fast_mode=False, feature_selection=False, n_features=200):
-    """Main execution function with options for faster runs"""
-    print(f"Home Credit Default Risk Solution (Fast mode: {fast_mode})\n")
+def main(fast_mode=False, feature_selection=False, n_features=200, analysis_mode=False):
+    """Main execution function with options for faster runs and analysis"""
+    print(f"Home Credit Default Risk Solution (Fast mode: {fast_mode}, Analysis mode: {analysis_mode})\n")
     
     # Setup logging
     log_path = f"{OUTPUT_PATH}/model_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     logger = setup_logging(log_path)
-    logger.info(f"Starting execution with fast_mode={fast_mode}, feature_selection={feature_selection}")
+    logger.info(f"Starting execution with fast_mode={fast_mode}, feature_selection={feature_selection}, analysis_mode={analysis_mode}")
+    
+    # Create analysis directory
+    analysis_path = f"{OUTPUT_PATH}/analysis"
+    if not os.path.exists(analysis_path):
+        os.makedirs(analysis_path)
     
     try:
         # Check if preprocessed data exists
@@ -1208,6 +1482,10 @@ def main(fast_mode=False, feature_selection=False, n_features=200):
                 feat_cols = select_features(train_features, train_target, feat_cols, n_features)
                 pd.Series(feat_cols).to_pickle(selected_file)
         
+        # Store all model predictions for analysis
+        all_oof_preds = {}
+        all_test_preds = {}
+        
         # Train models
         logger.info("Training models...")
         
@@ -1216,10 +1494,15 @@ def main(fast_mode=False, feature_selection=False, n_features=200):
             train_features, test_features, feat_cols, train_target, train_id, test_id, 
             folds=5, fast_mode=fast_mode
         )
+        all_oof_preds['lgbm'] = lgbm_oof
+        all_test_preds['lgbm'] = lgbm_submission['TARGET'].values
+        
+        # Save feature importance for analysis
+        if not lgbm_importance.empty:
+            lgbm_importance.to_csv(f"{analysis_path}/lgbm_feature_importance.csv", index=False)
         
         # If not in fast mode, train more models
         submissions_to_blend = [lgbm_submission['TARGET']]
-        oof_preds = {'lgbm': lgbm_oof}
         
         if not fast_mode:
             # XGB model
@@ -1229,7 +1512,13 @@ def main(fast_mode=False, feature_selection=False, n_features=200):
                     folds=5, fast_mode=fast_mode
                 )
                 submissions_to_blend.append(xgb_submission['TARGET'])
-                oof_preds['xgb'] = xgb_oof
+                all_oof_preds['xgb'] = xgb_oof
+                all_test_preds['xgb'] = xgb_submission['TARGET'].values
+                
+                # Save feature importance
+                if not xgb_importance.empty:
+                    xgb_importance.to_csv(f"{analysis_path}/xgb_feature_importance.csv", index=False)
+                
             except Exception as e:
                 logger.error(f"Error in XGBoost training: {e}")
                 
@@ -1240,25 +1529,75 @@ def main(fast_mode=False, feature_selection=False, n_features=200):
                     folds=5, fast_mode=fast_mode
                 )
                 submissions_to_blend.append(cat_submission['TARGET'])
-                oof_preds['catboost'] = cat_oof
+                all_oof_preds['catboost'] = cat_oof
+                all_test_preds['catboost'] = cat_submission['TARGET'].values
+                
+                # Save feature importance
+                if not cat_importance.empty:
+                    cat_importance.to_csv(f"{analysis_path}/catboost_feature_importance.csv", index=False)
+                
             except Exception as e:
                 logger.error(f"Error in CatBoost training: {e}")
         
         # Blend models if we have more than one
         if len(submissions_to_blend) > 1:
             blend_submission = blend_models(submissions_to_blend, test_id)
+            all_test_preds['blend'] = blend_submission['TARGET'].values
+            
+            # Calculate blended OOF predictions
+            blend_oof = np.zeros_like(all_oof_preds['lgbm'])
+            for model_name in all_oof_preds:
+                blend_oof += all_oof_preds[model_name] / len(all_oof_preds)
+            all_oof_preds['blend'] = blend_oof
         
         # Calculate OOF AUC for each model
-        logger.info(f"LightGBM OOF AUC: {roc_auc_score(train_target, oof_preds['lgbm'])}")
-        if 'xgb' in oof_preds:
-            logger.info(f"XGBoost OOF AUC: {roc_auc_score(train_target, oof_preds['xgb'])}")
-        if 'catboost' in oof_preds:
-            logger.info(f"CatBoost OOF AUC: {roc_auc_score(train_target, oof_preds['catboost'])}")
+        logger.info("Model performance summary:")
+        for model_name, preds in all_oof_preds.items():
+            logger.info(f"{model_name.upper()} OOF AUC: {roc_auc_score(train_target, preds):.6f}")
         
-        # Calculate OOF AUC for ensemble
-        if len(oof_preds) > 1:
-            blend_oof = sum(oof_preds.values()) / len(oof_preds)
-            logger.info(f"Blended OOF AUC: {roc_auc_score(train_target, blend_oof)}")
+        # Run additional analysis if in analysis mode
+        if analysis_mode:
+            logger.info("Running additional model analysis...")
+            
+            # Plot ROC curves
+            plot_roc_curves(all_oof_preds, train_target, analysis_path)
+            
+            # Analyze feature importance (using LightGBM importance as it's always available)
+            if not lgbm_importance.empty:
+                feature_analysis = analyze_feature_importance(
+                    lgbm_importance, train_features, train_target, analysis_path
+                )
+                
+            # Analyze feature correlations
+            feature_correlations = analyze_feature_correlations(
+                train_features, train_target, n_features=30, output_path=analysis_path
+            )
+            
+            # Compare model predictions
+            if len(all_oof_preds) > 1:
+                model_comparison = compare_model_predictions(
+                    all_oof_preds, train_features, train_target, test_features, test_id, analysis_path
+                )
+            
+            # Analyze model performance by segment
+            segment_performance = analyze_model_performance(
+                all_oof_preds, train_features, test_features, train_target, test_id, analysis_path
+            )
+            
+            # Save all model predictions for further analysis
+            oof_df = pd.DataFrame({'SK_ID_CURR': train_id.values, 'TARGET': train_target.values})
+            test_df = pd.DataFrame({'SK_ID_CURR': test_id.values})
+            
+            for model_name, preds in all_oof_preds.items():
+                oof_df[f'{model_name}_pred'] = preds
+                
+            for model_name, preds in all_test_preds.items():
+                test_df[f'{model_name}_pred'] = preds
+                
+            oof_df.to_csv(f"{analysis_path}/all_oof_predictions.csv", index=False)
+            test_df.to_csv(f"{analysis_path}/all_test_predictions.csv", index=False)
+            
+            logger.info("Analysis complete! Results saved to analysis directory.")
         
         logger.info("\nSubmission files created in the output directory!")
         
@@ -1274,7 +1613,9 @@ if __name__ == "__main__":
     parser.add_argument('--fast', action='store_true', help='Run in fast mode with reduced parameters')
     parser.add_argument('--feature_selection', action='store_true', help='Use feature selection')
     parser.add_argument('--n_features', type=int, default=200, help='Number of features to select')
+    parser.add_argument('--analyze', action='store_true', help='Run additional analysis')
     
     args = parser.parse_args()
     
-    main(fast_mode=args.fast, feature_selection=args.feature_selection, n_features=args.n_features)
+    main(fast_mode=args.fast, feature_selection=args.feature_selection, 
+         n_features=args.n_features, analysis_mode=args.analyze)
