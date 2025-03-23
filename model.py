@@ -1120,7 +1120,95 @@ def train_model_safely(model_type, X_train, y_train, X_valid, y_valid, params, f
         traceback.print_exc()
         return None
 
-def model_training_lgbm(train_df, test_df, features, target, train_id, test_id, folds=5, fast_mode=False):
+def save_model(model, model_name, fold=None, output_path=OUTPUT_PATH):
+    """Save a trained model to disk"""
+    import joblib
+    import os
+    
+    # Create models directory if it doesn't exist
+    models_dir = os.path.join(output_path, "saved_models")
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir)
+    
+    # Create model type subdirectory
+    model_type_dir = os.path.join(models_dir, model_name)
+    if not os.path.exists(model_type_dir):
+        os.makedirs(model_type_dir)
+    
+    # Generate filename - include fold number if provided
+    if fold is not None:
+        filename = f"{model_name}_fold_{fold}.pkl"
+    else:
+        filename = f"{model_name}_full.pkl"
+    
+    filepath = os.path.join(model_type_dir, filename)
+    
+    # Save the model
+    joblib.dump(model, filepath)
+    print(f"Model saved to {filepath}")
+    return filepath
+
+def load_model(model_name, fold=None, output_path=OUTPUT_PATH):
+    """Load a trained model from disk"""
+    import joblib
+    import os
+    
+    # Determine the file path
+    models_dir = os.path.join(output_path, "saved_models")
+    model_type_dir = os.path.join(models_dir, model_name)
+    
+    if fold is not None:
+        filename = f"{model_name}_fold_{fold}.pkl"
+    else:
+        filename = f"{model_name}_full.pkl"
+    
+    filepath = os.path.join(model_type_dir, filename)
+    
+    # Check if file exists
+    if not os.path.exists(filepath):
+        print(f"Model file {filepath} not found")
+        return None
+    
+    # Load the model
+    model = joblib.load(filepath)
+    print(f"Model loaded from {filepath}")
+    return model
+
+def save_blend_coefficients(coefficients, output_path=OUTPUT_PATH):
+    """Save blending coefficients to disk"""
+    import joblib
+    import os
+    
+    # Create models directory if it doesn't exist
+    models_dir = os.path.join(output_path, "saved_models")
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir)
+    
+    filepath = os.path.join(models_dir, "blend_coefficients.pkl")
+    
+    # Save the coefficients
+    joblib.dump(coefficients, filepath)
+    print(f"Blend coefficients saved to {filepath}")
+    return filepath
+
+def load_blend_coefficients(output_path=OUTPUT_PATH):
+    """Load blending coefficients from disk"""
+    import joblib
+    import os
+    
+    filepath = os.path.join(output_path, "saved_models", "blend_coefficients.pkl")
+    
+    # Check if file exists
+    if not os.path.exists(filepath):
+        print(f"Blend coefficients file {filepath} not found")
+        return None
+    
+    # Load the coefficients
+    coefficients = joblib.load(filepath)
+    print(f"Blend coefficients loaded from {filepath}")
+    return coefficients
+
+def model_training_lgbm(train_df, test_df, features, target, train_id, test_id, folds=5, fast_mode=False, save_models=False):
     """Train a LightGBM model and generate predictions"""
     with timer("LightGBM training"):
         # Prepare datasets
@@ -1142,6 +1230,9 @@ def model_training_lgbm(train_df, test_df, features, target, train_id, test_id, 
         oof_preds = np.zeros(train_data.shape[0])
         test_preds = np.zeros(test_data.shape[0])
         feature_importance_df = pd.DataFrame()
+        
+        # List to store trained models if saving is enabled
+        trained_models = []
         
         # Train across folds
         for fold_, (trn_idx, val_idx) in enumerate(fold_indices):
@@ -1174,7 +1265,16 @@ def model_training_lgbm(train_df, test_df, features, target, train_id, test_id, 
             # Calculate AUC for this fold
             print(f'Fold {fold_ + 1} AUC: {roc_auc_score(y_valid, oof_preds[val_idx])}')
             
-            del X_train, X_valid, y_train, y_valid, model
+            # Save the model if requested
+            if save_models:
+                save_model(model, 'lgbm', fold_)
+                # Store mapping of feature names
+                save_model(cleaned_columns, 'feature_map')
+                trained_models.append(model)
+            
+            del X_train, X_valid, y_train, y_valid
+            if not save_models:
+                del model
             gc.collect()
         
         # Calculate overall AUC
@@ -1185,11 +1285,23 @@ def model_training_lgbm(train_df, test_df, features, target, train_id, test_id, 
         
         # Feature importance - only if we have data
         if not feature_importance_df.empty and 'feature' in feature_importance_df.columns:
-            display_importances(feature_importance_df)
-        
-        return submission, feature_importance_df, oof_preds
+            display_importances(feature_importance_df, model_name="lgbm")  
 
-def model_training_xgb(train_df, test_df, features, target, train_id, test_id, folds=5, fast_mode=False):
+        # Also train a full model on all data if saving is enabled
+        if save_models:
+            print("Training full model on all data...")
+            full_model = lgb.LGBMClassifier(**params)
+            full_model.fit(train_data, target)
+            save_model(full_model, 'lgbm')
+            trained_models.append(full_model)
+        
+        # Return models if saving is enabled
+        if save_models:
+            return submission, feature_importance_df, oof_preds, trained_models
+        else:
+            return submission, feature_importance_df, oof_preds
+
+def model_training_xgb(train_df, test_df, features, target, train_id, test_id, folds=5, fast_mode=False, save_models=False):
     """Train an XGBoost model and generate predictions"""
     with timer("XGBoost training"):
         # Prepare datasets
@@ -1211,6 +1323,9 @@ def model_training_xgb(train_df, test_df, features, target, train_id, test_id, f
         oof_preds = np.zeros(train_data.shape[0])
         test_preds = np.zeros(test_data.shape[0])
         feature_importance_df = pd.DataFrame()
+        
+        # List to store trained models if saving is enabled
+        trained_models = []
         
         # Train across folds
         for fold_, (trn_idx, val_idx) in enumerate(fold_indices):
@@ -1243,7 +1358,17 @@ def model_training_xgb(train_df, test_df, features, target, train_id, test_id, f
             # Calculate AUC for this fold
             print(f'Fold {fold_ + 1} AUC: {roc_auc_score(y_valid, oof_preds[val_idx])}')
             
-            del X_train, X_valid, y_train, y_valid, model
+            # Save the model if requested
+            if save_models:
+                save_model(model, 'xgb', fold_)
+                # Store mapping of feature names if not already saved
+                if fold_ == 0:
+                    save_model(cleaned_columns, 'feature_map')
+                trained_models.append(model)
+            
+            del X_train, X_valid, y_train, y_valid
+            if not save_models:
+                del model
             gc.collect()
         
         # Calculate overall AUC
@@ -1254,11 +1379,23 @@ def model_training_xgb(train_df, test_df, features, target, train_id, test_id, f
         
         # Feature importance - only if we have data
         if not feature_importance_df.empty and 'feature' in feature_importance_df.columns:
-            display_importances(feature_importance_df)
+            display_importances(feature_importance_df, model_name="xgb")
         
-        return submission, feature_importance_df, oof_preds
+        # Also train a full model on all data if saving is enabled
+        if save_models:
+            print("Training full model on all data...")
+            full_model = xgb.XGBClassifier(**params)
+            full_model.fit(train_data, target)
+            save_model(full_model, 'xgb')
+            trained_models.append(full_model)
+        
+        # Return models if saving is enabled
+        if save_models:
+            return submission, feature_importance_df, oof_preds, trained_models
+        else:
+            return submission, feature_importance_df, oof_preds
 
-def model_training_catboost(train_df, test_df, features, target, train_id, test_id, folds=5, fast_mode=False):
+def model_training_catboost(train_df, test_df, features, target, train_id, test_id, folds=5, fast_mode=False, save_models=False):
     """Train a CatBoost model and generate predictions"""
     with timer("CatBoost training"):
         # Prepare datasets
@@ -1280,6 +1417,9 @@ def model_training_catboost(train_df, test_df, features, target, train_id, test_
         oof_preds = np.zeros(train_data.shape[0])
         test_preds = np.zeros(test_data.shape[0])
         feature_importance_df = pd.DataFrame()
+        
+        # List to store trained models if saving is enabled
+        trained_models = []
         
         # Train across folds
         for fold_, (trn_idx, val_idx) in enumerate(fold_indices):
@@ -1312,7 +1452,17 @@ def model_training_catboost(train_df, test_df, features, target, train_id, test_
             # Calculate AUC for this fold
             print(f'Fold {fold_ + 1} AUC: {roc_auc_score(y_valid, oof_preds[val_idx])}')
             
-            del X_train, X_valid, y_train, y_valid, model
+            # Save the model if requested
+            if save_models:
+                save_model(model, 'catboost', fold_)
+                # Store mapping of feature names if not already saved
+                if fold_ == 0:
+                    save_model(cleaned_columns, 'feature_map')
+                trained_models.append(model)
+            
+            del X_train, X_valid, y_train, y_valid
+            if not save_models:
+                del model
             gc.collect()
         
         # Calculate overall AUC
@@ -1323,9 +1473,26 @@ def model_training_catboost(train_df, test_df, features, target, train_id, test_
         
         # Feature importance - only if we have data
         if not feature_importance_df.empty and 'feature' in feature_importance_df.columns:
-            display_importances(feature_importance_df)
+            display_importances(feature_importance_df, model_name="catboost")
         
-        return submission, feature_importance_df, oof_preds
+        # Also train a full model on all data if saving is enabled
+        if save_models:
+            print("Training full model on all data...")
+            # Remove early stopping from full model training to avoid issues
+            full_params = params.copy()
+            if 'early_stopping_rounds' in full_params:
+                del full_params['early_stopping_rounds']
+            
+            full_model = CatBoostClassifier(**full_params)
+            full_model.fit(train_data, target, verbose=200)
+            save_model(full_model, 'catboost')
+            trained_models.append(full_model)
+        
+        # Return models if saving is enabled
+        if save_models:
+            return submission, feature_importance_df, oof_preds, trained_models
+        else:
+            return submission, feature_importance_df, oof_preds
 
 def blend_models(submissions, test_id):
     """Blend multiple models' predictions"""
@@ -1341,8 +1508,8 @@ def blend_models(submissions, test_id):
         
         return blend_submission
 
-def display_importances(feature_importance_df):
-    """Display feature importances"""
+def display_importances(feature_importance_df, model_name="model"):
+    """Display feature importances with model-specific filenames"""
     try:
         # Check if we have the required columns
         if 'feature' not in feature_importance_df.columns or 'importance' not in feature_importance_df.columns:
@@ -1357,20 +1524,45 @@ def display_importances(feature_importance_df):
         plt.figure(figsize=(10, max(5, n_features/2)))
         sns.barplot(x='importance', y='feature', 
                    data=feature_importance_df.sort_values(by='importance', ascending=False).head(n_features))
-        plt.title(f'Features (Top {n_features} by importance)')
+        plt.title(f'{model_name.upper()} - Top {n_features} Features by Importance')
         plt.tight_layout()
-        plt.savefig(f'{OUTPUT_PATH}/feature_importance.png')
+        
+        # Save with model-specific filename
+        output_file = f'{OUTPUT_PATH}/feature_importance_{model_name.lower()}.png'
+        plt.savefig(output_file)
+        plt.close()
+        print(f"Feature importance plot saved to {output_file}")
+        
     except Exception as e:
-        print(f"Error generating feature importance plot: {str(e)}")
+        print(f"Error generating feature importance plot for {model_name}: {str(e)}")
 
-def main(fast_mode=False, feature_selection=False, n_features=200, analysis_mode=False):
-    """Main execution function with options for faster runs and analysis"""
-    print(f"Home Credit Default Risk Solution (Fast mode: {fast_mode}, Analysis mode: {analysis_mode})\n")
+def main(fast_mode=False, feature_selection=False, n_features=200, analysis_mode=False, save_models=False, 
+         hybrid_mode=False):
+    """
+    Main execution function with special hybrid mode that loads LGBM & XGB and trains new CatBoost
+    
+    Parameters:
+    -----------
+    fast_mode: bool
+        Run in fast mode with reduced parameters
+    feature_selection: bool
+        Use feature selection
+    n_features: int
+        Number of features to select
+    analysis_mode: bool
+        Run additional analysis
+    save_models: bool
+        Save trained models to disk
+    hybrid_mode: bool
+        Load saved LGBM & XGB, train new CatBoost, and create a new blend
+    """
+    print(f"Home Credit Default Risk Solution (Fast mode: {fast_mode}, Analysis mode: {analysis_mode}, Hybrid mode: {hybrid_mode})\n")
     
     # Setup logging
     log_path = f"{OUTPUT_PATH}/model_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     logger = setup_logging(log_path)
-    logger.info(f"Starting execution with fast_mode={fast_mode}, feature_selection={feature_selection}, analysis_mode={analysis_mode}")
+    logger.info(f"Starting execution with fast_mode={fast_mode}, feature_selection={feature_selection}, " + 
+                f"analysis_mode={analysis_mode}, save_models={save_models}, hybrid_mode={hybrid_mode}")
     
     # Create analysis directory
     analysis_path = f"{OUTPUT_PATH}/analysis"
@@ -1482,92 +1674,369 @@ def main(fast_mode=False, feature_selection=False, n_features=200, analysis_mode
                 feat_cols = select_features(train_features, train_target, feat_cols, n_features)
                 pd.Series(feat_cols).to_pickle(selected_file)
         
-        # Store all model predictions for analysis
+        # Store all model predictions and models
         all_oof_preds = {}
         all_test_preds = {}
+        saved_models = {}
         
-        # Train models
-        logger.info("Training models...")
-        
-        # LGBM model
-        lgbm_submission, lgbm_importance, lgbm_oof = model_training_lgbm(
-            train_features, test_features, feat_cols, train_target, train_id, test_id, 
-            folds=5, fast_mode=fast_mode
-        )
-        all_oof_preds['lgbm'] = lgbm_oof
-        all_test_preds['lgbm'] = lgbm_submission['TARGET'].values
-        
-        # Save feature importance for analysis
-        if not lgbm_importance.empty:
-            lgbm_importance.to_csv(f"{analysis_path}/lgbm_feature_importance.csv", index=False)
-        
-        # If not in fast mode, train more models
-        submissions_to_blend = [lgbm_submission['TARGET']]
-        
-        if not fast_mode:
-            # XGB model
+         # HYBRID MODE: Load LGBM and XGB, train new CatBoost, create new blend
+        if hybrid_mode:
+            logger.info("Running in hybrid mode: Loading LGBM and XGB, training new CatBoost...")
+            
+            # 1. First load the saved LGBM model
+            lgbm_model = load_model('lgbm')
+            if lgbm_model is None:
+                logger.error("No saved LGBM model found. Hybrid mode requires saved LGBM model.")
+                return
+                
+            saved_models['lgbm'] = lgbm_model
+            logger.info("Loaded LGBM model from disk")
+            
+            # 2. Get feature map if available to ensure correct column order
+            feature_map = load_model('feature_map')
+            
+            # 3. Then load the saved XGBoost model 
+            xgb_model = load_model('xgb')
+            if xgb_model is None:
+                logger.error("No saved XGB model found. Hybrid mode requires saved XGB model.")
+                return
+                
+            saved_models['xgb'] = xgb_model
+            logger.info("Loaded XGBoost model from disk")
+            
+            # 4. Make predictions with LGBM
+            if feature_map is not None:
+                # Apply feature name mapping if needed
+                test_data_lgbm = test_features[feat_cols].copy()
+                test_data_lgbm.columns = [feature_map.get(col, col) for col in test_data_lgbm.columns]
+                all_test_preds['lgbm'] = lgbm_model.predict_proba(test_data_lgbm)[:, 1]
+            else:
+                # Just use features as is
+                all_test_preds['lgbm'] = lgbm_model.predict_proba(test_features[feat_cols])[:, 1]
+            
+            logger.info("Generated LightGBM predictions")
+            
+            # 5. Make predictions with XGBoost
+            if feature_map is not None:
+                # Apply feature name mapping if needed
+                test_data_xgb = test_features[feat_cols].copy()
+                test_data_xgb.columns = [feature_map.get(col, col) for col in test_data_xgb.columns]
+                all_test_preds['xgb'] = xgb_model.predict_proba(test_data_xgb)[:, 1]
+            else:
+                # Just use features as is
+                all_test_preds['xgb'] = xgb_model.predict_proba(test_features[feat_cols])[:, 1]
+            
+            logger.info("Generated XGBoost predictions")
+            
+            # 6. Now train a fresh CatBoost model
+            logger.info("Training a new CatBoost model...")
             try:
-                xgb_submission, xgb_importance, xgb_oof = model_training_xgb(
-                    train_features, test_features, feat_cols, train_target, train_id, test_id,
-                    folds=5, fast_mode=fast_mode
-                )
-                submissions_to_blend.append(xgb_submission['TARGET'])
-                all_oof_preds['xgb'] = xgb_oof
-                all_test_preds['xgb'] = xgb_submission['TARGET'].values
+                if save_models:
+                    cat_submission, cat_importance, cat_oof, cat_models = model_training_catboost(
+                        train_features, test_features, feat_cols, train_target, train_id, test_id,
+                        folds=5, fast_mode=fast_mode, save_models=True
+                    )
+                    saved_models['catboost'] = cat_models[-1]  # Keep the full model
+                else:
+                    cat_submission, cat_importance, cat_oof = model_training_catboost(
+                        train_features, test_features, feat_cols, train_target, train_id, test_id,
+                        folds=5, fast_mode=fast_mode, save_models=False
+                    )
                 
-                # Save feature importance
-                if not xgb_importance.empty:
-                    xgb_importance.to_csv(f"{analysis_path}/xgb_feature_importance.csv", index=False)
-                
-            except Exception as e:
-                logger.error(f"Error in XGBoost training: {e}")
-                
-            # CatBoost model
-            try:
-                cat_submission, cat_importance, cat_oof = model_training_catboost(
-                    train_features, test_features, feat_cols, train_target, train_id, test_id,
-                    folds=5, fast_mode=fast_mode
-                )
-                submissions_to_blend.append(cat_submission['TARGET'])
-                all_oof_preds['catboost'] = cat_oof
                 all_test_preds['catboost'] = cat_submission['TARGET'].values
+                all_oof_preds['catboost'] = cat_oof
                 
                 # Save feature importance
                 if not cat_importance.empty:
                     cat_importance.to_csv(f"{analysis_path}/catboost_feature_importance.csv", index=False)
                 
+                logger.info("CatBoost model trained and predictions generated")
+                
             except Exception as e:
                 logger.error(f"Error in CatBoost training: {e}")
-        
-        # Blend models if we have more than one
-        if len(submissions_to_blend) > 1:
-            blend_submission = blend_models(submissions_to_blend, test_id)
-            all_test_preds['blend'] = blend_submission['TARGET'].values
+                logger.error("Cannot complete hybrid mode without CatBoost - aborting")
+                return
             
-            # Calculate blended OOF predictions
-            blend_oof = np.zeros_like(all_oof_preds['lgbm'])
-            for model_name in all_oof_preds:
-                blend_oof += all_oof_preds[model_name] / len(all_oof_preds)
-            all_oof_preds['blend'] = blend_oof
+            # 7. Create blend with all three models
+            logger.info("Creating a new blend with LGBM, XGB and new CatBoost...")
+            
+            # Load the train oof predictions for LGBM and XGB (needed for calculating blend weights)
+            oof_file = f"{analysis_path}/all_oof_predictions.csv"
+
+            if os.path.exists(oof_file):
+                # We have saved OOF predictions
+                oof_df = pd.read_csv(oof_file)
+                if 'lgbm_pred' in oof_df.columns and 'xgb_pred' in oof_df.columns:
+                    all_oof_preds['lgbm'] = oof_df['lgbm_pred'].values
+                    all_oof_preds['xgb'] = oof_df['xgb_pred'].values
+                    logger.info("Loaded saved OOF predictions for LGBM and XGB")
+                else:
+                    logger.warning("OOF predictions file exists but doesn't have required columns")
+                    # Use equal weights since we don't have OOF predictions
+                    blend_coeffs = {
+                        'lgbm': 1.0/3,
+                        'xgb': 1.0/3,
+                        'catboost': 1.0/3
+                    }
+            else:
+                logger.warning("No saved OOF predictions found, using equal weights for blend")
+                # Use equal weights since we don't have OOF predictions
+                blend_coeffs = {
+                    'lgbm': 1.0/3,
+                    'xgb': 1.0/3,
+                    'catboost': 1.0/3
+                }
+            
+            # If we have OOF predictions for all models, determine weights based on OOF AUC
+            if len(all_oof_preds) == 3:  # we have all three
+                # Calculate AUC for each model
+                model_aucs = {}
+                for model_name, preds in all_oof_preds.items():
+                    model_aucs[model_name] = roc_auc_score(train_target, preds)
+                
+                # Calculate weights proportional to (AUC - 0.5)
+                total_score = sum(auc - 0.5 for auc in model_aucs.values())
+                blend_coeffs = {model: (auc - 0.5) / total_score for model, auc in model_aucs.items()}
+                
+                logger.info(f"Calculated blend weights based on OOF AUC: {blend_coeffs}")
+            
+            # Create weighted blend predictions
+            blend_preds = np.zeros(test_features.shape[0])
+            for model_name, coeff in blend_coeffs.items():
+                if model_name in all_test_preds:
+                    blend_preds += all_test_preds[model_name] * coeff
+            
+            all_test_preds['blend'] = blend_preds
+            
+            # Save the blend coefficients
+            if save_models:
+                save_blend_coefficients(blend_coeffs)
+                logger.info(f"Saved blend coefficients to disk: {blend_coeffs}")
+            
+            # Generate submission files
+            for model_name, preds in all_test_preds.items():
+                prefix = "hybrid_" if model_name != 'catboost' else 'new_'
+                generate_submission_file(test_id, preds, f"{prefix}{model_name}")
+            
+            logger.info("Hybrid mode completed successfully. Generated submissions for all models and blend.")
+            
+        elif load_saved_models:
+            logger.info("Loading saved models instead of training new ones...")
+            
+            # Load LGBM model
+            lgbm_model = load_model('lgbm')
+            if lgbm_model is not None:
+                saved_models['lgbm'] = lgbm_model
+                
+                # Get feature map if available to ensure correct column order
+                feature_map = load_model('feature_map')
+                
+                # Make predictions
+                if feature_map is not None:
+                    # Apply feature name mapping if needed
+                    test_data = test_features[feat_cols].copy()
+                    test_data.columns = [feature_map.get(col, col) for col in test_data.columns]
+                    all_test_preds['lgbm'] = lgbm_model.predict_proba(test_data)[:, 1]
+                else:
+                    # Just use features as is
+                    all_test_preds['lgbm'] = lgbm_model.predict_proba(test_features[feat_cols])[:, 1]
+                
+                # Generate submission
+                generate_submission_file(test_id, all_test_preds['lgbm'], "loaded_lgbm")
+                logger.info("Generated LightGBM predictions from saved model")
+            else:
+                logger.warning("No saved LightGBM model found")
+            
+            # Load XGB model
+            xgb_model = load_model('xgb')
+            if xgb_model is not None:
+                saved_models['xgb'] = xgb_model
+                
+                # Make predictions
+                if feature_map is not None:
+                    # Apply feature name mapping if needed
+                    test_data = test_features[feat_cols].copy()
+                    test_data.columns = [feature_map.get(col, col) for col in test_data.columns]
+                    all_test_preds['xgb'] = xgb_model.predict_proba(test_data)[:, 1]
+                else:
+                    # Just use features as is
+                    all_test_preds['xgb'] = xgb_model.predict_proba(test_features[feat_cols])[:, 1]
+                
+                # Generate submission
+                generate_submission_file(test_id, all_test_preds['xgb'], "loaded_xgb")
+                logger.info("Generated XGBoost predictions from saved model")
+            else:
+                logger.warning("No saved XGBoost model found")
+            
+            # Load CatBoost model
+            cat_model = load_model('catboost')
+            if cat_model is not None:
+                saved_models['catboost'] = cat_model
+                
+                # Make predictions
+                if feature_map is not None:
+                    # Apply feature name mapping if needed
+                    test_data = test_features[feat_cols].copy()
+                    test_data.columns = [feature_map.get(col, col) for col in test_data.columns]
+                    all_test_preds['catboost'] = cat_model.predict_proba(test_data)[:, 1]
+                else:
+                    # Just use features as is
+                    all_test_preds['catboost'] = cat_model.predict_proba(test_features[feat_cols])[:, 1]
+                
+                # Generate submission
+                generate_submission_file(test_id, all_test_preds['catboost'], "loaded_catboost")
+                logger.info("Generated CatBoost predictions from saved model")
+            else:
+                logger.warning("No saved CatBoost model found")
+            
+            # If we have multiple models, create blended predictions
+            if len(saved_models) > 1:
+                # Load blend coefficients or use equal weights
+                blend_coeffs = load_blend_coefficients()
+                if blend_coeffs is None:
+                    # Use equal weights
+                    logger.info("No saved blend coefficients found, using equal weights")
+                    blend_preds = np.zeros(test_features.shape[0])
+                    for model_name, preds in all_test_preds.items():
+                        blend_preds += preds / len(all_test_preds)
+                else:
+                    # Use saved coefficients
+                    logger.info(f"Using saved blend coefficients: {blend_coeffs}")
+                    blend_preds = np.zeros(test_features.shape[0])
+                    for model_name, coeff in blend_coeffs.items():
+                        if model_name in all_test_preds:
+                            blend_preds += all_test_preds[model_name] * coeff
+                
+                all_test_preds['blend'] = blend_preds
+                
+                # Generate blended submission
+                generate_submission_file(test_id, blend_preds, "loaded_blend")
+                logger.info("Generated blended predictions from saved models")
+            
+            # If no models were loaded, train from scratch
+            if not saved_models:
+                logger.warning("No saved models found. Training from scratch.")
+                load_saved_models = False
         
-        # Calculate OOF AUC for each model
-        logger.info("Model performance summary:")
-        for model_name, preds in all_oof_preds.items():
-            logger.info(f"{model_name.upper()} OOF AUC: {roc_auc_score(train_target, preds):.6f}")
+        # Train models if not loading saved ones
+        else:
+            # Train models
+            logger.info("Training models...")
+            
+            # LGBM model
+            if save_models:
+                lgbm_submission, lgbm_importance, lgbm_oof, lgbm_models = model_training_lgbm(
+                    train_features, test_features, feat_cols, train_target, train_id, test_id, 
+                    folds=5, fast_mode=fast_mode, save_models=True
+                )
+                saved_models['lgbm'] = lgbm_models[-1]  # Keep the full model
+            else:
+                lgbm_submission, lgbm_importance, lgbm_oof = model_training_lgbm(
+                    train_features, test_features, feat_cols, train_target, train_id, test_id, 
+                    folds=5, fast_mode=fast_mode, save_models=False
+                )
+            
+            all_oof_preds['lgbm'] = lgbm_oof
+            all_test_preds['lgbm'] = lgbm_submission['TARGET'].values
+            
+            # Save feature importance for analysis
+            if not lgbm_importance.empty:
+                lgbm_importance.to_csv(f"{analysis_path}/lgbm_feature_importance.csv", index=False)
+            
+            # If not in fast mode, train more models
+            submissions_to_blend = [lgbm_submission['TARGET']]
+            
+            if not fast_mode:
+                # XGB model
+                try:
+                    if save_models:
+                        xgb_submission, xgb_importance, xgb_oof, xgb_models = model_training_xgb(
+                            train_features, test_features, feat_cols, train_target, train_id, test_id,
+                            folds=5, fast_mode=fast_mode, save_models=True
+                        )
+                        saved_models['xgb'] = xgb_models[-1]  # Keep the full model
+                    else:
+                        xgb_submission, xgb_importance, xgb_oof = model_training_xgb(
+                            train_features, test_features, feat_cols, train_target, train_id, test_id,
+                            folds=5, fast_mode=fast_mode, save_models=False
+                        )
+                    
+                    submissions_to_blend.append(xgb_submission['TARGET'])
+                    all_oof_preds['xgb'] = xgb_oof
+                    all_test_preds['xgb'] = xgb_submission['TARGET'].values
+                    
+                    # Save feature importance
+                    if not xgb_importance.empty:
+                        xgb_importance.to_csv(f"{analysis_path}/xgb_feature_importance.csv", index=False)
+                    
+                except Exception as e:
+                    logger.error(f"Error in XGBoost training: {e}")
+                    
+                # CatBoost model
+                try:
+                    if save_models:
+                        cat_submission, cat_importance, cat_oof, cat_models = model_training_catboost(
+                            train_features, test_features, feat_cols, train_target, train_id, test_id,
+                            folds=5, fast_mode=fast_mode, save_models=True
+                        )
+                        saved_models['catboost'] = cat_models[-1]  # Keep the full model
+                    else:
+                        cat_submission, cat_importance, cat_oof = model_training_catboost(
+                            train_features, test_features, feat_cols, train_target, train_id, test_id,
+                            folds=5, fast_mode=fast_mode, save_models=False
+                        )
+                    
+                    submissions_to_blend.append(cat_submission['TARGET'])
+                    all_oof_preds['catboost'] = cat_oof
+                    all_test_preds['catboost'] = cat_submission['TARGET'].values
+                    
+                    # Save feature importance
+                    if not cat_importance.empty:
+                        cat_importance.to_csv(f"{analysis_path}/catboost_feature_importance.csv", index=False)
+                    
+                except Exception as e:
+                    logger.error(f"Error in CatBoost training: {e}")
+            
+            # Blend models if we have more than one
+            if len(submissions_to_blend) > 1:
+                blend_submission = blend_models(submissions_to_blend, test_id)
+                all_test_preds['blend'] = blend_submission['TARGET'].values
+                
+                # Calculate blended OOF predictions
+                blend_oof = np.zeros_like(all_oof_preds['lgbm'])
+                for model_name in all_oof_preds:
+                    blend_oof += all_oof_preds[model_name] / len(all_oof_preds)
+                all_oof_preds['blend'] = blend_oof
+                
+                # If saving models, also save the blend coefficients
+                if save_models:
+                    # For equal weighting, just save the model names with equal weights
+                    blend_coeffs = {model_name: 1.0/len(all_oof_preds) for model_name in all_oof_preds 
+                                   if model_name != 'blend'}  # Skip blend itself
+                    save_blend_coefficients(blend_coeffs)
+                    
+        # Calculate OOF AUC for each model if we have OOF predictions
+        if all_oof_preds:
+            logger.info("Model performance summary:")
+            for model_name, preds in all_oof_preds.items():
+                logger.info(f"{model_name.upper()} OOF AUC: {roc_auc_score(train_target, preds):.6f}")
         
         # Run additional analysis if in analysis mode
-        if analysis_mode:
+        if analysis_mode and all_oof_preds:
             logger.info("Running additional model analysis...")
             
             # Plot ROC curves
             plot_roc_curves(all_oof_preds, train_target, analysis_path)
             
-            # Analyze feature importance (using LightGBM importance as it's always available)
-            if not lgbm_importance.empty:
-                feature_analysis = analyze_feature_importance(
-                    lgbm_importance, train_features, train_target, analysis_path
-                )
-                
+            # Analyze feature importance if available
+            lgbm_importance_file = f"{analysis_path}/lgbm_feature_importance.csv"
+            if os.path.exists(lgbm_importance_file):
+                lgbm_importance = pd.read_csv(lgbm_importance_file)
+                if not lgbm_importance.empty:
+                    feature_analysis = analyze_feature_importance(
+                        lgbm_importance, train_features, train_target, analysis_path
+                    )
+                    
             # Analyze feature correlations
             feature_correlations = analyze_feature_correlations(
                 train_features, train_target, n_features=30, output_path=analysis_path
@@ -1599,7 +2068,18 @@ def main(fast_mode=False, feature_selection=False, n_features=200, analysis_mode
             
             logger.info("Analysis complete! Results saved to analysis directory.")
         
-        logger.info("\nSubmission files created in the output directory!")
+        logger.info("\nExecution complete!")
+        if load_saved_models:
+            logger.info("Used saved models to generate predictions.")
+        else:
+            logger.info("Trained new models and generated predictions.")
+        
+        if save_models:
+            logger.info("Models saved to disk for future use.")
+        
+        logger.info(f"Submission files created in {OUTPUT_PATH}")
+        
+        logger.info("\nExecution complete!")
         
     except Exception as e:
         logger.error(f"Error in main execution: {str(e)}")
@@ -1614,8 +2094,13 @@ if __name__ == "__main__":
     parser.add_argument('--feature_selection', action='store_true', help='Use feature selection')
     parser.add_argument('--n_features', type=int, default=200, help='Number of features to select')
     parser.add_argument('--analyze', action='store_true', help='Run additional analysis')
+    parser.add_argument('--save_models', action='store_true', help='Save trained models to disk')
+    parser.add_argument('--load_models', action='store_true', help='Load saved models instead of training new ones')
+    parser.add_argument('--hybrid', action='store_true', 
+                       help='Hybrid mode: load LGBM & XGB, train new CatBoost, create new blend')
     
     args = parser.parse_args()
     
     main(fast_mode=args.fast, feature_selection=args.feature_selection, 
-         n_features=args.n_features, analysis_mode=args.analyze)
+         n_features=args.n_features, analysis_mode=args.analyze,
+         save_models=args.save_models, hybrid_mode=args.hybrid)
